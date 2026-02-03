@@ -95,7 +95,6 @@ async function createConference(name) {
         body: JSON.stringify({
           name: name,
           beep_enabled: "never",
-          call_control_id: OUTBOUND_CONNECTION_ID,
         }),
       }
     );
