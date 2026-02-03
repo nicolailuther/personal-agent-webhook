@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -189,15 +189,15 @@ async function joinConference(conferenceId, callControlId) {
 
 /**
  * Dial out to ElevenLabs SIP
- * Using agent_id format: sip:<agent_id>@<agent_id>.sip.rtc.elevenlabs.io
+ * Format: sip:<agent_id>@sip.rtc.elevenlabs.io
  */
 async function dialElevenLabsSIP(agentId, fromNumber) {
   const apiKey = process.env.TELNYX_API_KEY;
   if (!apiKey) return { success: false, error: "No API key" };
 
   try {
-    // ElevenLabs SIP format uses agent_id, not phone_number_id
-    const sipUri = `sip:${agentId}@${agentId}.sip.rtc.elevenlabs.io`;
+    // ElevenLabs SIP format: agent_id@sip.rtc.elevenlabs.io
+    const sipUri = `sip:${agentId}@sip.rtc.elevenlabs.io`;
     console.log(`[Telnyx] Dialing ElevenLabs SIP: ${sipUri}`);
 
     const response = await fetch(
