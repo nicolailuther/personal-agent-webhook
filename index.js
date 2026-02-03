@@ -62,6 +62,42 @@ async function answerCall(callControlId) {
 }
 
 /**
+ * Speak a message on the call
+ */
+async function speakMessage(callControlId, message) {
+  const apiKey = process.env.TELNYX_API_KEY;
+  if (!apiKey) return { success: false, error: "No API key" };
+
+  try {
+    const response = await fetch(
+      `https://api.telnyx.com/v2/calls/${callControlId}/actions/speak`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          payload: message,
+          voice: "female",
+          language: "en-US",
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.errors?.[0]?.detail || `API error: ${response.status}`);
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error("[Telnyx] Error speaking:", error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
  * Transfer call to ElevenLabs via SIP
  */
 async function transferToElevenLabsSIP(callControlId, phoneNumberId) {
@@ -131,7 +167,14 @@ async function handleInboundCall(payload) {
   }
 
   // Small delay to ensure call is fully answered
-  await new Promise(resolve => setTimeout(resolve, 500));
+  await new Promise(resolve => setTimeout(resolve, 300));
+
+  // Play brief hold message
+  console.log(`[Webhook] Playing hold message...`);
+  await speakMessage(callControlId, "One moment please.");
+
+  // Wait for message to complete
+  await new Promise(resolve => setTimeout(resolve, 1500));
 
   // Transfer to ElevenLabs
   console.log(`[Webhook] Transferring to ElevenLabs ${agentConfig.agentName}...`);
