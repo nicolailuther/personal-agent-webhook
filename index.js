@@ -4,9 +4,16 @@ const cors = require("cors");
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Version for tracking deploys
+const VERSION = "1.1.0";
+const DEPLOY_TIME = new Date().toISOString();
+
 // Store recent events (in-memory, max 100)
 const events = [];
 const MAX_EVENTS = 100;
+
+// Debug log for operation results
+const debugLog = [];
 
 // Track calls pending conference setup (answered but not yet in conference)
 const pendingCalls = new Map();
@@ -34,15 +41,40 @@ const OUTBOUND_CONNECTION_ID = "2887328154249069899";
 app.use(cors());
 app.use(express.json());
 
+// Helper to log debug info
+function logDebug(operation, data) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    operation,
+    ...data,
+  };
+  debugLog.unshift(entry);
+  if (debugLog.length > 50) debugLog.pop();
+  console.log(`[Debug] ${operation}:`, JSON.stringify(data));
+}
+
 // Health check
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     service: "personal-agent-webhook",
+    version: VERSION,
+    deploy_time: DEPLOY_TIME,
     events_stored: events.length,
     pending_calls: pendingCalls.size,
     active_conferences: activeConferences.size,
     timestamp: new Date().toISOString(),
+  });
+});
+
+// Debug endpoint
+app.get("/debug", (req, res) => {
+  res.json({
+    version: VERSION,
+    deploy_time: DEPLOY_TIME,
+    pending_calls: Array.from(pendingCalls.entries()),
+    active_conferences: Array.from(activeConferences.entries()),
+    recent_operations: debugLog.slice(0, 20),
   });
 });
 
@@ -217,6 +249,7 @@ async function handleCallInitiated(payload) {
   }
 
   console.log(`[Webhook] Inbound call from ${from} to ${agentConfig.agentName} (${to})`);
+  logDebug("call_initiated", { callControlId, from, to, agent: agentConfig.agentName });
 
   // Store pending info - we'll set up the conference when we get call.answered
   pendingCalls.set(callControlId, {
@@ -229,6 +262,8 @@ async function handleCallInitiated(payload) {
   // Answer the call - conference setup will happen in handleCallAnswered
   console.log(`[Webhook] Answering call...`);
   const answerResult = await answerCall(callControlId);
+  logDebug("answer_call", { callControlId, success: answerResult.success, error: answerResult.error });
+
   if (!answerResult.success) {
     console.error(`[Webhook] Failed to answer: ${answerResult.error}`);
     pendingCalls.delete(callControlId);
@@ -248,6 +283,8 @@ async function handleCallAnswered(payload) {
 
   // Check if this is an inbound call pending conference setup
   const pendingInfo = pendingCalls.get(callControlId);
+  logDebug("call_answered_check", { callControlId, hasPendingInfo: !!pendingInfo, pendingCallsSize: pendingCalls.size });
+
   if (pendingInfo) {
     pendingCalls.delete(callControlId);
     console.log(`[Webhook] Inbound call now answered, setting up conference...`);
@@ -255,6 +292,8 @@ async function handleCallAnswered(payload) {
     // Create conference with caller
     const confName = `call_${Date.now()}`;
     const confResult = await createConference(confName, callControlId);
+    logDebug("create_conference", { confName, callControlId, success: confResult.success, conferenceId: confResult.conferenceId, error: confResult.error });
+
     if (!confResult.success) {
       console.error(`[Webhook] Failed to create conference: ${confResult.error}`);
       return;
@@ -265,6 +304,14 @@ async function handleCallAnswered(payload) {
     // Dial ElevenLabs
     console.log(`[Webhook] Dialing ElevenLabs ${pendingInfo.agentConfig.agentName}...`);
     const dialResult = await dialElevenLabsSIP(pendingInfo.agentConfig.phoneNumberId, pendingInfo.to);
+    logDebug("dial_elevenlabs", {
+      phoneNumberId: pendingInfo.agentConfig.phoneNumberId,
+      from: pendingInfo.to,
+      success: dialResult.success,
+      callControlId: dialResult.callControlId,
+      error: dialResult.error
+    });
+
     if (!dialResult.success) {
       console.error(`[Webhook] Failed to dial ElevenLabs: ${dialResult.error}`);
       return;
@@ -280,22 +327,28 @@ async function handleCallAnswered(payload) {
       createdAt: new Date().toISOString(),
     });
 
-    console.log(`[Webhook] Waiting for ElevenLabs to answer...`);
+    console.log(`[Webhook] Waiting for ElevenLabs to answer... (tracking ${dialResult.callControlId})`);
+    logDebug("elevenlabs_dial_complete", { elevenLabsCallControlId: dialResult.callControlId, conferenceId: confResult.conferenceId });
     return;
   }
 
   // Check if this is an ElevenLabs call we're tracking
   const confInfo = activeConferences.get(callControlId);
+  logDebug("elevenlabs_answered_check", { callControlId, hasConfInfo: !!confInfo, activeConferencesSize: activeConferences.size });
+
   if (confInfo) {
     console.log(`[Webhook] ElevenLabs answered! Joining to conference ${confInfo.conferenceId}`);
 
     const joinResult = await joinConference(confInfo.conferenceId, callControlId);
+    logDebug("join_elevenlabs_to_conference", { conferenceId: confInfo.conferenceId, callControlId, success: joinResult.success, error: joinResult.error });
+
     if (!joinResult.success) {
       console.error(`[Webhook] Failed to join ElevenLabs to conference: ${joinResult.error}`);
       return;
     }
 
     console.log(`[Webhook] Call connected! Caller <-> ${confInfo.agentName}`);
+    logDebug("call_connected", { agent: confInfo.agentName, from: confInfo.from, conferenceId: confInfo.conferenceId });
     return;
   }
 }
