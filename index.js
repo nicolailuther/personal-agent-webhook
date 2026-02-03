@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "2.0.0";
+const VERSION = "3.0.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -21,22 +21,17 @@ const pendingCalls = new Map();
 // Track active conferences for join handling
 const activeConferences = new Map();
 
-// Track expected ElevenLabs callbacks (for matching incoming AI calls)
-// Key: "fromNumber->toNumber", Value: { conferenceId, agentName, callerFrom, timestamp }
-const pendingAICallbacks = new Map();
+// Track AI legs by call_control_id (for matching call.answered events)
+const pendingAILegs = new Map();
 
 // Agent phone numbers and their ElevenLabs config
-// Executive Assistant routes through Call Control App for monitoring
 const AGENT_PHONE_NUMBERS = {
   "+18635008639": {
-    phoneNumberId: "phnum_2601kgh5cqwkf3x89a64gftmggda",
-    agentId: "agent_1201kgh4q7abf8n8zvfewvwyqr1e",
     agentName: "Executive Assistant",
-    bridgeNumber: "+18638387141", // Bridge to user's personal phone
   },
 };
 
-// Connection ID for outbound calls (Call Control Application with webhook URL configured)
+// Connection ID for outbound calls (Call Control Application)
 const OUTBOUND_CONNECTION_ID = "2887328154249069899";
 
 app.use(cors());
@@ -64,7 +59,7 @@ app.get("/", (req, res) => {
     events_stored: events.length,
     pending_calls: pendingCalls.size,
     active_conferences: activeConferences.size,
-    pending_ai_callbacks: pendingAICallbacks.size,
+    pending_ai_legs: pendingAILegs.size,
     timestamp: new Date().toISOString(),
   });
 });
@@ -76,11 +71,10 @@ app.get("/debug", (req, res) => {
     deploy_time: DEPLOY_TIME,
     config: {
       hasTelnyxKey: !!process.env.TELNYX_API_KEY,
-      hasElevenLabsKey: !!process.env.ELEVENLABS_API_KEY,
     },
     pending_calls: Array.from(pendingCalls.entries()),
     active_conferences: Array.from(activeConferences.entries()),
-    pending_ai_callbacks: Array.from(pendingAICallbacks.entries()),
+    pending_ai_legs: Array.from(pendingAILegs.entries()),
     recent_operations: debugLog.slice(0, 20),
   });
 });
@@ -195,55 +189,64 @@ async function joinConference(conferenceId, callControlId) {
 }
 
 /**
- * Trigger ElevenLabs to make an outbound call
- * Uses the ElevenLabs outbound API to have the AI call a bridge number
- * which then gets joined to our conference
+ * Dial ElevenLabs SIP endpoint directly via Telnyx
+ * This connects to the AI agent associated with the phone number
  *
- * API: POST https://api.elevenlabs.io/v1/convai/sip-trunk/outbound-call
+ * SIP format: sip:<phone-number>@sip.rtc.elevenlabs.io
  */
-async function triggerElevenLabsOutbound(agentId, phoneNumberId, toNumber) {
-  const apiKey = process.env.ELEVENLABS_API_KEY;
-  if (!apiKey) {
-    console.error("[ElevenLabs] No API key configured");
-    return { success: false, error: "No ElevenLabs API key" };
-  }
+async function dialElevenLabsSIP(agentPhoneNumber, conferenceId, callerFrom) {
+  const apiKey = process.env.TELNYX_API_KEY;
+  if (!apiKey) return { success: false, error: "No API key" };
+
+  // Build SIP URI - strip the + from phone number
+  const phoneDigits = agentPhoneNumber.replace("+", "");
+  const sipUri = `sip:${phoneDigits}@sip.rtc.elevenlabs.io`;
 
   try {
-    console.log(`[ElevenLabs] Triggering outbound call: agent=${agentId}, to=${toNumber}`);
+    console.log(`[Telnyx] Dialing ElevenLabs SIP: ${sipUri}`);
+
+    // Create client_state to track this call
+    const clientState = Buffer.from(JSON.stringify({
+      type: "ai_leg",
+      conferenceId: conferenceId,
+      callerFrom: callerFrom,
+    })).toString("base64");
 
     const response = await fetch(
-      "https://api.elevenlabs.io/v1/convai/sip-trunk/outbound-call",
+      "https://api.telnyx.com/v2/calls",
       {
         method: "POST",
         headers: {
-          "xi-api-key": apiKey,
+          Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          agent_id: agentId,
-          agent_phone_number_id: phoneNumberId,
-          to_number: toNumber,
+          connection_id: OUTBOUND_CONNECTION_ID,
+          to: sipUri,
+          from: agentPhoneNumber,
+          client_state: clientState,
+          answering_machine_detection: "disabled",
         }),
       }
     );
 
-    const data = await response.json();
-
     if (!response.ok) {
-      const errorMsg = data.detail?.message || data.detail || data.message || `API error: ${response.status}`;
-      console.error(`[ElevenLabs] Outbound call failed: ${errorMsg}`);
+      const errorData = await response.json();
+      const errorMsg = errorData.errors?.[0]?.detail || `API error: ${response.status}`;
+      console.error(`[Telnyx] SIP dial failed: ${errorMsg}`);
       throw new Error(errorMsg);
     }
 
-    console.log(`[ElevenLabs] Outbound call initiated:`, data);
+    const data = await response.json();
+    console.log(`[Telnyx] SIP call initiated: ${data.data.call_control_id}`);
+
     return {
-      success: data.success !== false,
-      conversationId: data.conversation_id,
-      sipCallId: data.sip_call_id,
-      message: data.message,
+      success: true,
+      callControlId: data.data.call_control_id,
+      callLegId: data.data.call_leg_id,
     };
   } catch (error) {
-    console.error("[ElevenLabs] Error triggering outbound call:", error.message);
+    console.error("[Telnyx] Error dialing SIP:", error.message);
     return { success: false, error: error.message };
   }
 }
@@ -251,7 +254,6 @@ async function triggerElevenLabsOutbound(agentId, phoneNumberId, toNumber) {
 /**
  * Handle call.initiated
  * - For regular inbound calls: answer and mark pending for conference setup
- * - For ElevenLabs callback calls: just mark as pending AI callback
  */
 async function handleCallInitiated(payload) {
   const callControlId = payload?.call_control_id;
@@ -259,38 +261,12 @@ async function handleCallInitiated(payload) {
   const from = payload?.from;
   const direction = payload?.direction;
 
+  // Only handle inbound calls
   if (!callControlId || (direction !== "inbound" && direction !== "incoming")) {
     return;
   }
 
-  // Check if this is an ElevenLabs AI callback (AI calling the bridge number)
-  const callbackKey = `${from}->${to}`;
-  const pendingCallback = pendingAICallbacks.get(callbackKey);
-
-  if (pendingCallback) {
-    console.log(`[Webhook] ElevenLabs AI callback detected: ${from} -> ${to}`);
-    logDebug("ai_callback_initiated", { callControlId, from, to, conferenceId: pendingCallback.conferenceId });
-
-    // Answer the AI call
-    const answerResult = await answerCall(callControlId);
-    if (!answerResult.success) {
-      console.error(`[Webhook] Failed to answer AI callback: ${answerResult.error}`);
-      return;
-    }
-
-    // Store for joining on call.answered
-    activeConferences.set(callControlId, {
-      conferenceId: pendingCallback.conferenceId,
-      agentName: pendingCallback.agentName,
-      callerFrom: pendingCallback.callerFrom,
-      isAICallback: true,
-    });
-
-    pendingAICallbacks.delete(callbackKey);
-    return;
-  }
-
-  // Check if this is a call to one of our agent numbers (regular caller)
+  // Check if this is a call to one of our agent numbers
   const agentConfig = AGENT_PHONE_NUMBERS[to];
   if (!agentConfig) {
     console.log(`[Webhook] Inbound call to ${to} - not an agent number, ignoring`);
@@ -308,7 +284,7 @@ async function handleCallInitiated(payload) {
     timestamp: Date.now(),
   });
 
-  // Answer the call - conference setup will happen in handleCallAnswered
+  // Answer the call
   console.log(`[Webhook] Answering call...`);
   const answerResult = await answerCall(callControlId);
   logDebug("answer_call", { callControlId, success: answerResult.success, error: answerResult.error });
@@ -324,41 +300,53 @@ async function handleCallInitiated(payload) {
 
 /**
  * Handle call.answered
- * - For inbound calls: set up conference and trigger ElevenLabs outbound
- * - For AI callback calls: join to conference
+ * - For inbound calls: set up conference and dial ElevenLabs SIP
+ * - For AI SIP calls: join to conference
  */
 async function handleCallAnswered(payload) {
   const callControlId = payload?.call_control_id;
+  const clientStateB64 = payload?.client_state;
 
-  // Check if this is an AI callback we're tracking
-  const confInfo = activeConferences.get(callControlId);
-  if (confInfo && confInfo.isAICallback) {
-    console.log(`[Webhook] AI callback answered! Joining to conference ${confInfo.conferenceId}`);
+  // Check if this is an AI leg answering (has client_state)
+  if (clientStateB64) {
+    try {
+      const clientState = JSON.parse(Buffer.from(clientStateB64, "base64").toString());
 
-    const joinResult = await joinConference(confInfo.conferenceId, callControlId);
-    logDebug("join_ai_to_conference", {
-      conferenceId: confInfo.conferenceId,
-      callControlId,
-      success: joinResult.success,
-      error: joinResult.error,
-    });
+      if (clientState.type === "ai_leg") {
+        console.log(`[Webhook] AI SIP call answered! Joining to conference ${clientState.conferenceId}`);
+        logDebug("ai_leg_answered", { callControlId, conferenceId: clientState.conferenceId });
 
-    if (!joinResult.success) {
-      console.error(`[Webhook] Failed to join AI to conference: ${joinResult.error}`);
-      return;
+        const joinResult = await joinConference(clientState.conferenceId, callControlId);
+        logDebug("join_ai_to_conference", {
+          conferenceId: clientState.conferenceId,
+          callControlId,
+          success: joinResult.success,
+          error: joinResult.error,
+        });
+
+        if (!joinResult.success) {
+          console.error(`[Webhook] Failed to join AI to conference: ${joinResult.error}`);
+          return;
+        }
+
+        // Update activeConferences with AI call info
+        for (const [confId, confData] of activeConferences.entries()) {
+          if (confData.conferenceId === clientState.conferenceId) {
+            confData.aiCallControlId = callControlId;
+            confData.aiConnected = true;
+            console.log(`[Webhook] Call connected! Caller <-> AI`);
+            logDebug("call_connected", {
+              conferenceId: clientState.conferenceId,
+              callerFrom: clientState.callerFrom,
+            });
+            break;
+          }
+        }
+        return;
+      }
+    } catch (e) {
+      // Not valid JSON client_state, continue normal flow
     }
-
-    // Update conference info (no longer just a callback, now fully connected)
-    confInfo.isAICallback = false;
-    confInfo.aiCallControlId = callControlId;
-
-    console.log(`[Webhook] Call connected! Caller <-> ${confInfo.agentName}`);
-    logDebug("call_connected", {
-      agent: confInfo.agentName,
-      callerFrom: confInfo.callerFrom,
-      conferenceId: confInfo.conferenceId,
-    });
-    return;
   }
 
   // Check if this is an inbound call pending conference setup
@@ -391,50 +379,41 @@ async function handleCallAnswered(payload) {
 
     console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
 
-    // Trigger ElevenLabs outbound call to bridge number
-    const agentConfig = pendingInfo.agentConfig;
-    const bridgeNumber = agentConfig.bridgeNumber;
-
-    console.log(`[Webhook] Triggering ElevenLabs ${agentConfig.agentName} to call ${bridgeNumber}...`);
-
-    // Register expected callback BEFORE triggering outbound
-    // Key is "agentNumber->bridgeNumber" since that's how the call will appear
-    const callbackKey = `${pendingInfo.to}->${bridgeNumber}`;
-    pendingAICallbacks.set(callbackKey, {
+    // Store conference info
+    activeConferences.set(callControlId, {
       conferenceId: confResult.conferenceId,
-      agentName: agentConfig.agentName,
+      agentName: pendingInfo.agentConfig.agentName,
       callerFrom: pendingInfo.from,
-      timestamp: Date.now(),
+      callerCallControlId: callControlId,
+      agentPhoneNumber: pendingInfo.to,
+      aiCallControlId: null,
+      aiConnected: false,
+      createdAt: new Date().toISOString(),
     });
 
-    logDebug("registered_ai_callback", {
-      callbackKey,
-      conferenceId: confResult.conferenceId,
-      agentName: agentConfig.agentName,
-    });
+    // Dial ElevenLabs SIP endpoint
+    console.log(`[Webhook] Dialing ElevenLabs SIP for ${pendingInfo.agentConfig.agentName}...`);
 
-    const outboundResult = await triggerElevenLabsOutbound(
-      agentConfig.agentId,
-      agentConfig.phoneNumberId,
-      bridgeNumber
+    const sipResult = await dialElevenLabsSIP(
+      pendingInfo.to,
+      confResult.conferenceId,
+      pendingInfo.from
     );
 
-    logDebug("elevenlabs_outbound", {
-      agentId: agentConfig.agentId,
-      phoneNumberId: agentConfig.phoneNumberId,
-      bridgeNumber,
-      success: outboundResult.success,
-      conversationId: outboundResult.conversationId,
-      error: outboundResult.error,
+    logDebug("dial_elevenlabs_sip", {
+      agentPhoneNumber: pendingInfo.to,
+      conferenceId: confResult.conferenceId,
+      success: sipResult.success,
+      aiCallControlId: sipResult.callControlId,
+      error: sipResult.error,
     });
 
-    if (!outboundResult.success) {
-      console.error(`[Webhook] Failed to trigger ElevenLabs outbound: ${outboundResult.error}`);
-      pendingAICallbacks.delete(callbackKey);
+    if (!sipResult.success) {
+      console.error(`[Webhook] Failed to dial ElevenLabs SIP: ${sipResult.error}`);
       return;
     }
 
-    console.log(`[Webhook] ElevenLabs outbound initiated. Waiting for AI to call ${bridgeNumber}...`);
+    console.log(`[Webhook] ElevenLabs SIP call initiated. Waiting for AI to answer...`);
     return;
   }
 }
@@ -454,18 +433,16 @@ function handleCallHangup(payload) {
     console.log(`[Webhook] Call ended, cleaning up conference tracking`);
     activeConferences.delete(callControlId);
   }
-}
 
-// Cleanup stale pending callbacks (older than 60 seconds)
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, value] of pendingAICallbacks.entries()) {
-    if (now - value.timestamp > 60000) {
-      console.log(`[Cleanup] Removing stale AI callback: ${key}`);
-      pendingAICallbacks.delete(key);
+  // Also check if this was an AI leg
+  for (const [confCallId, confData] of activeConferences.entries()) {
+    if (confData.aiCallControlId === callControlId) {
+      console.log(`[Webhook] AI leg hung up, cleaning up`);
+      confData.aiCallControlId = null;
+      confData.aiConnected = false;
     }
   }
-}, 30000);
+}
 
 // Receive Telnyx webhooks
 app.post("/telnyx-webhook", async (req, res) => {
@@ -575,10 +552,5 @@ app.listen(PORT, () => {
     console.log(`Telnyx API key configured`);
   } else {
     console.log(`WARNING: No TELNYX_API_KEY`);
-  }
-  if (process.env.ELEVENLABS_API_KEY) {
-    console.log(`ElevenLabs API key configured`);
-  } else {
-    console.log(`WARNING: No ELEVENLABS_API_KEY - AI outbound calls disabled`);
   }
 });
