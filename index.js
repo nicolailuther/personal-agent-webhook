@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 3001;
 const events = [];
 const MAX_EVENTS = 100;
 
+// Track calls pending conference setup (answered but not yet in conference)
+const pendingCalls = new Map();
+
 // Track active conferences for join handling
 const activeConferences = new Map();
 
@@ -37,6 +40,7 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "personal-agent-webhook",
     events_stored: events.length,
+    pending_calls: pendingCalls.size,
     active_conferences: activeConferences.size,
     timestamp: new Date().toISOString(),
   });
@@ -78,13 +82,13 @@ async function answerCall(callControlId) {
 
 /**
  * Create a conference with an initial call
- * Telnyx requires a call_control_id to create a conference (auto-joins that call)
  */
 async function createConference(name, callControlId) {
   const apiKey = process.env.TELNYX_API_KEY;
   if (!apiKey) return { success: false, error: "No API key" };
 
   try {
+    console.log(`[Telnyx] Creating conference ${name} with call ${callControlId}`);
     const response = await fetch(
       "https://api.telnyx.com/v2/conferences",
       {
@@ -103,10 +107,13 @@ async function createConference(name, callControlId) {
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.errors?.[0]?.detail || `API error: ${response.status}`);
+      const errorMsg = errorData.errors?.[0]?.detail || `API error: ${response.status}`;
+      console.error(`[Telnyx] Conference creation failed: ${errorMsg}`);
+      throw new Error(errorMsg);
     }
 
     const data = await response.json();
+    console.log(`[Telnyx] Conference created: ${data.data.id}`);
     return { success: true, conferenceId: data.data.id };
   } catch (error) {
     console.error("[Telnyx] Error creating conference:", error.message);
@@ -149,7 +156,7 @@ async function joinConference(conferenceId, callControlId) {
 }
 
 /**
- * Dial out to ElevenLabs SIP and get call_control_id
+ * Dial out to ElevenLabs SIP
  */
 async function dialElevenLabsSIP(phoneNumberId, fromNumber) {
   const apiKey = process.env.TELNYX_API_KEY;
@@ -190,14 +197,9 @@ async function dialElevenLabsSIP(phoneNumberId, fromNumber) {
 }
 
 /**
- * Handle inbound call - conference-based approach
- * 1. Answer the call
- * 2. Create conference
- * 3. Join caller to conference
- * 4. Dial ElevenLabs (outbound)
- * 5. Join ElevenLabs to same conference when it answers
+ * Handle call.initiated - just answer and mark as pending
  */
-async function handleInboundCall(payload) {
+async function handleCallInitiated(payload) {
   const callControlId = payload?.call_control_id;
   const to = payload?.to;
   const from = payload?.from;
@@ -216,68 +218,86 @@ async function handleInboundCall(payload) {
 
   console.log(`[Webhook] Inbound call from ${from} to ${agentConfig.agentName} (${to})`);
 
-  // Step 1: Answer the call
+  // Store pending info - we'll set up the conference when we get call.answered
+  pendingCalls.set(callControlId, {
+    from,
+    to,
+    agentConfig,
+    timestamp: Date.now(),
+  });
+
+  // Answer the call - conference setup will happen in handleCallAnswered
   console.log(`[Webhook] Answering call...`);
   const answerResult = await answerCall(callControlId);
   if (!answerResult.success) {
     console.error(`[Webhook] Failed to answer: ${answerResult.error}`);
+    pendingCalls.delete(callControlId);
     return;
   }
 
-  // Step 2: Create conference with caller already joined
-  // Telnyx requires call_control_id to create conference (auto-joins that call)
-  const confName = `call_${Date.now()}`;
-  console.log(`[Webhook] Creating conference: ${confName} with caller`);
-  const confResult = await createConference(confName, callControlId);
-  if (!confResult.success) {
-    console.error(`[Webhook] Failed to create conference: ${confResult.error}`);
-    return;
-  }
-  console.log(`[Webhook] Conference created, caller auto-joined: ${confResult.conferenceId}`);
-
-  // Step 4: Dial ElevenLabs
-  console.log(`[Webhook] Dialing ElevenLabs ${agentConfig.agentName}...`);
-  const dialResult = await dialElevenLabsSIP(agentConfig.phoneNumberId, to);
-  if (!dialResult.success) {
-    console.error(`[Webhook] Failed to dial ElevenLabs: ${dialResult.error}`);
-    return;
-  }
-
-  // Store conference info for when ElevenLabs answers
-  activeConferences.set(dialResult.callControlId, {
-    conferenceId: confResult.conferenceId,
-    callerCallControlId: callControlId,
-    agentName: agentConfig.agentName,
-    from: from,
-    to: to,
-    createdAt: new Date().toISOString(),
-  });
-
-  console.log(`[Webhook] Waiting for ElevenLabs to answer. Conference: ${confResult.conferenceId}`);
+  console.log(`[Webhook] Call answered, waiting for call.answered event to set up conference`);
 }
 
 /**
- * Handle call.answered - join ElevenLabs to conference when it picks up
+ * Handle call.answered
+ * - For inbound calls: set up conference and dial ElevenLabs
+ * - For ElevenLabs calls: join to conference
  */
 async function handleCallAnswered(payload) {
   const callControlId = payload?.call_control_id;
 
-  // Check if this is an ElevenLabs call we're tracking
-  const confInfo = activeConferences.get(callControlId);
-  if (!confInfo) {
-    return; // Not an ElevenLabs call we initiated
-  }
+  // Check if this is an inbound call pending conference setup
+  const pendingInfo = pendingCalls.get(callControlId);
+  if (pendingInfo) {
+    pendingCalls.delete(callControlId);
+    console.log(`[Webhook] Inbound call now answered, setting up conference...`);
 
-  console.log(`[Webhook] ElevenLabs answered! Joining to conference ${confInfo.conferenceId}`);
+    // Create conference with caller
+    const confName = `call_${Date.now()}`;
+    const confResult = await createConference(confName, callControlId);
+    if (!confResult.success) {
+      console.error(`[Webhook] Failed to create conference: ${confResult.error}`);
+      return;
+    }
 
-  // Join ElevenLabs call to the conference
-  const joinResult = await joinConference(confInfo.conferenceId, callControlId);
-  if (!joinResult.success) {
-    console.error(`[Webhook] Failed to join ElevenLabs to conference: ${joinResult.error}`);
+    console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
+
+    // Dial ElevenLabs
+    console.log(`[Webhook] Dialing ElevenLabs ${pendingInfo.agentConfig.agentName}...`);
+    const dialResult = await dialElevenLabsSIP(pendingInfo.agentConfig.phoneNumberId, pendingInfo.to);
+    if (!dialResult.success) {
+      console.error(`[Webhook] Failed to dial ElevenLabs: ${dialResult.error}`);
+      return;
+    }
+
+    // Store conference info for when ElevenLabs answers
+    activeConferences.set(dialResult.callControlId, {
+      conferenceId: confResult.conferenceId,
+      callerCallControlId: callControlId,
+      agentName: pendingInfo.agentConfig.agentName,
+      from: pendingInfo.from,
+      to: pendingInfo.to,
+      createdAt: new Date().toISOString(),
+    });
+
+    console.log(`[Webhook] Waiting for ElevenLabs to answer...`);
     return;
   }
 
-  console.log(`[Webhook] Call connected! Caller <-> ${confInfo.agentName} (conference: ${confInfo.conferenceId})`);
+  // Check if this is an ElevenLabs call we're tracking
+  const confInfo = activeConferences.get(callControlId);
+  if (confInfo) {
+    console.log(`[Webhook] ElevenLabs answered! Joining to conference ${confInfo.conferenceId}`);
+
+    const joinResult = await joinConference(confInfo.conferenceId, callControlId);
+    if (!joinResult.success) {
+      console.error(`[Webhook] Failed to join ElevenLabs to conference: ${joinResult.error}`);
+      return;
+    }
+
+    console.log(`[Webhook] Call connected! Caller <-> ${confInfo.agentName}`);
+    return;
+  }
 }
 
 /**
@@ -286,9 +306,13 @@ async function handleCallAnswered(payload) {
 function handleCallHangup(payload) {
   const callControlId = payload?.call_control_id;
 
-  // Remove from tracking if it's an ElevenLabs call
+  if (pendingCalls.has(callControlId)) {
+    console.log(`[Webhook] Pending call ended before setup`);
+    pendingCalls.delete(callControlId);
+  }
+
   if (activeConferences.has(callControlId)) {
-    console.log(`[Webhook] ElevenLabs call ended, cleaning up conference tracking`);
+    console.log(`[Webhook] ElevenLabs call ended, cleaning up`);
     activeConferences.delete(callControlId);
   }
 }
@@ -309,7 +333,7 @@ app.post("/telnyx-webhook", async (req, res) => {
     raw: data,
   };
 
-  console.log(`[Webhook] Received: ${data.event_type}`, JSON.stringify(data.payload, null, 2));
+  console.log(`[Webhook] Received: ${data.event_type}`);
 
   // Add to events array (FIFO)
   events.unshift(event);
@@ -319,7 +343,7 @@ app.post("/telnyx-webhook", async (req, res) => {
 
   // Handle different event types
   if (data.event_type === "call.initiated") {
-    handleInboundCall(data.payload).catch(err => {
+    handleCallInitiated(data.payload).catch(err => {
       console.error("[Webhook] Error handling inbound call:", err.message);
     });
   } else if (data.event_type === "call.answered") {
