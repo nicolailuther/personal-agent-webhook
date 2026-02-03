@@ -189,13 +189,15 @@ async function joinConference(conferenceId, callControlId) {
 
 /**
  * Dial out to ElevenLabs SIP
+ * Using agent_id format: sip:<agent_id>@<agent_id>.sip.rtc.elevenlabs.io
  */
-async function dialElevenLabsSIP(phoneNumberId, fromNumber) {
+async function dialElevenLabsSIP(agentId, fromNumber) {
   const apiKey = process.env.TELNYX_API_KEY;
   if (!apiKey) return { success: false, error: "No API key" };
 
   try {
-    const sipUri = `sip:${phoneNumberId}@sip.rtc.elevenlabs.io:5061;transport=tls`;
+    // ElevenLabs SIP format uses agent_id, not phone_number_id
+    const sipUri = `sip:${agentId}@${agentId}.sip.rtc.elevenlabs.io`;
     console.log(`[Telnyx] Dialing ElevenLabs SIP: ${sipUri}`);
 
     const response = await fetch(
@@ -301,11 +303,11 @@ async function handleCallAnswered(payload) {
 
     console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
 
-    // Dial ElevenLabs
+    // Dial ElevenLabs using agent_id
     console.log(`[Webhook] Dialing ElevenLabs ${pendingInfo.agentConfig.agentName}...`);
-    const dialResult = await dialElevenLabsSIP(pendingInfo.agentConfig.phoneNumberId, pendingInfo.to);
+    const dialResult = await dialElevenLabsSIP(pendingInfo.agentConfig.agentId, pendingInfo.to);
     logDebug("dial_elevenlabs", {
-      phoneNumberId: pendingInfo.agentConfig.phoneNumberId,
+      agentId: pendingInfo.agentConfig.agentId,
       from: pendingInfo.to,
       success: dialResult.success,
       callControlId: dialResult.callControlId,
