@@ -8,6 +8,9 @@ const PORT = process.env.PORT || 3001;
 const events = [];
 const MAX_EVENTS = 100;
 
+// Track active conferences for join handling
+const activeConferences = new Map();
+
 // Agent phone numbers and their ElevenLabs config
 const AGENT_PHONE_NUMBERS = {
   "+18635008639": {
@@ -22,6 +25,9 @@ const AGENT_PHONE_NUMBERS = {
   },
 };
 
+// Connection ID for outbound calls
+const OUTBOUND_CONNECTION_ID = "2883735034622117580";
+
 app.use(cors());
 app.use(express.json());
 
@@ -31,6 +37,7 @@ app.get("/", (req, res) => {
     status: "ok",
     service: "personal-agent-webhook",
     events_stored: events.length,
+    active_conferences: activeConferences.size,
     timestamp: new Date().toISOString(),
   });
 });
@@ -70,15 +77,15 @@ async function answerCall(callControlId) {
 }
 
 /**
- * Speak a message on the call
+ * Create a conference
  */
-async function speakMessage(callControlId, message) {
+async function createConference(name) {
   const apiKey = process.env.TELNYX_API_KEY;
   if (!apiKey) return { success: false, error: "No API key" };
 
   try {
     const response = await fetch(
-      `https://api.telnyx.com/v2/calls/${callControlId}/actions/speak`,
+      "https://api.telnyx.com/v2/conferences",
       {
         method: "POST",
         headers: {
@@ -86,9 +93,44 @@ async function speakMessage(callControlId, message) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          payload: message,
-          voice: "female",
-          language: "en-US",
+          name: name,
+          beep_enabled: "never",
+          call_control_id: OUTBOUND_CONNECTION_ID,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.errors?.[0]?.detail || `API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    return { success: true, conferenceId: data.data.id };
+  } catch (error) {
+    console.error("[Telnyx] Error creating conference:", error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Join a call to a conference
+ */
+async function joinConference(conferenceId, callControlId) {
+  const apiKey = process.env.TELNYX_API_KEY;
+  if (!apiKey) return { success: false, error: "No API key" };
+
+  try {
+    const response = await fetch(
+      `https://api.telnyx.com/v2/conferences/${conferenceId}/actions/join`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          call_control_id: callControlId,
         }),
       }
     );
@@ -100,36 +142,36 @@ async function speakMessage(callControlId, message) {
 
     return { success: true };
   } catch (error) {
-    console.error("[Telnyx] Error speaking:", error.message);
+    console.error("[Telnyx] Error joining conference:", error.message);
     return { success: false, error: error.message };
   }
 }
 
 /**
- * Transfer call to ElevenLabs via SIP
+ * Dial out to ElevenLabs SIP and get call_control_id
  */
-async function transferToElevenLabsSIP(callControlId, phoneNumberId, agentId, phoneNumber) {
+async function dialElevenLabsSIP(phoneNumberId, fromNumber) {
   const apiKey = process.env.TELNYX_API_KEY;
-  if (!apiKey) {
-    console.error("[Telnyx] No API key configured");
-    return { success: false, error: "No API key" };
-  }
+  if (!apiKey) return { success: false, error: "No API key" };
 
   try {
-    // Try using the phone number in the SIP URI (E.164 format without +)
-    const phoneDigits = phoneNumber.replace('+', '');
-    const sipUri = `sip:${phoneDigits}@sip.rtc.elevenlabs.io:5061;transport=tls`;
-    console.log(`[Telnyx] Transferring call ${callControlId} to ElevenLabs SIP: ${sipUri}`);
+    const sipUri = `sip:${phoneNumberId}@sip.rtc.elevenlabs.io:5061;transport=tls`;
+    console.log(`[Telnyx] Dialing ElevenLabs SIP: ${sipUri}`);
 
     const response = await fetch(
-      `https://api.telnyx.com/v2/calls/${callControlId}/actions/transfer`,
+      "https://api.telnyx.com/v2/calls",
       {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ to: sipUri }),
+        body: JSON.stringify({
+          connection_id: OUTBOUND_CONNECTION_ID,
+          to: sipUri,
+          from: fromNumber,
+          answering_machine_detection: "disabled",
+        }),
       }
     );
 
@@ -138,15 +180,21 @@ async function transferToElevenLabsSIP(callControlId, phoneNumberId, agentId, ph
       throw new Error(errorData.errors?.[0]?.detail || `API error: ${response.status}`);
     }
 
-    return { success: true };
+    const data = await response.json();
+    return { success: true, callControlId: data.data.call_control_id };
   } catch (error) {
-    console.error("[Telnyx] Error transferring to ElevenLabs:", error.message);
+    console.error("[Telnyx] Error dialing ElevenLabs:", error.message);
     return { success: false, error: error.message };
   }
 }
 
 /**
- * Handle inbound call - answer and transfer to ElevenLabs
+ * Handle inbound call - conference-based approach
+ * 1. Answer the call
+ * 2. Create conference
+ * 3. Join caller to conference
+ * 4. Dial ElevenLabs (outbound)
+ * 5. Join ElevenLabs to same conference when it answers
  */
 async function handleInboundCall(payload) {
   const callControlId = payload?.call_control_id;
@@ -167,7 +215,7 @@ async function handleInboundCall(payload) {
 
   console.log(`[Webhook] Inbound call from ${from} to ${agentConfig.agentName} (${to})`);
 
-  // Answer the call first (required for transfer to work properly)
+  // Step 1: Answer the call
   console.log(`[Webhook] Answering call...`);
   const answerResult = await answerCall(callControlId);
   if (!answerResult.success) {
@@ -175,15 +223,79 @@ async function handleInboundCall(payload) {
     return;
   }
 
-  // Immediately transfer to ElevenLabs (no delay, no message)
-  console.log(`[Webhook] Transferring to ElevenLabs ${agentConfig.agentName}...`);
-  const transferResult = await transferToElevenLabsSIP(callControlId, agentConfig.phoneNumberId, agentConfig.agentId, to);
-  if (!transferResult.success) {
-    console.error(`[Webhook] Failed to transfer: ${transferResult.error}`);
+  // Step 2: Create a conference
+  const confName = `call_${Date.now()}`;
+  console.log(`[Webhook] Creating conference: ${confName}`);
+  const confResult = await createConference(confName);
+  if (!confResult.success) {
+    console.error(`[Webhook] Failed to create conference: ${confResult.error}`);
     return;
   }
 
-  console.log(`[Webhook] Call successfully transferred to ElevenLabs ${agentConfig.agentName}`);
+  // Step 3: Join caller to conference
+  console.log(`[Webhook] Joining caller to conference...`);
+  const joinResult = await joinConference(confResult.conferenceId, callControlId);
+  if (!joinResult.success) {
+    console.error(`[Webhook] Failed to join caller to conference: ${joinResult.error}`);
+    return;
+  }
+
+  // Step 4: Dial ElevenLabs
+  console.log(`[Webhook] Dialing ElevenLabs ${agentConfig.agentName}...`);
+  const dialResult = await dialElevenLabsSIP(agentConfig.phoneNumberId, to);
+  if (!dialResult.success) {
+    console.error(`[Webhook] Failed to dial ElevenLabs: ${dialResult.error}`);
+    return;
+  }
+
+  // Store conference info for when ElevenLabs answers
+  activeConferences.set(dialResult.callControlId, {
+    conferenceId: confResult.conferenceId,
+    callerCallControlId: callControlId,
+    agentName: agentConfig.agentName,
+    from: from,
+    to: to,
+    createdAt: new Date().toISOString(),
+  });
+
+  console.log(`[Webhook] Waiting for ElevenLabs to answer. Conference: ${confResult.conferenceId}`);
+}
+
+/**
+ * Handle call.answered - join ElevenLabs to conference when it picks up
+ */
+async function handleCallAnswered(payload) {
+  const callControlId = payload?.call_control_id;
+
+  // Check if this is an ElevenLabs call we're tracking
+  const confInfo = activeConferences.get(callControlId);
+  if (!confInfo) {
+    return; // Not an ElevenLabs call we initiated
+  }
+
+  console.log(`[Webhook] ElevenLabs answered! Joining to conference ${confInfo.conferenceId}`);
+
+  // Join ElevenLabs call to the conference
+  const joinResult = await joinConference(confInfo.conferenceId, callControlId);
+  if (!joinResult.success) {
+    console.error(`[Webhook] Failed to join ElevenLabs to conference: ${joinResult.error}`);
+    return;
+  }
+
+  console.log(`[Webhook] Call connected! Caller <-> ${confInfo.agentName} (conference: ${confInfo.conferenceId})`);
+}
+
+/**
+ * Handle call.hangup - cleanup
+ */
+function handleCallHangup(payload) {
+  const callControlId = payload?.call_control_id;
+
+  // Remove from tracking if it's an ElevenLabs call
+  if (activeConferences.has(callControlId)) {
+    console.log(`[Webhook] ElevenLabs call ended, cleaning up conference tracking`);
+    activeConferences.delete(callControlId);
+  }
 }
 
 // Receive Telnyx webhooks
@@ -210,11 +322,17 @@ app.post("/telnyx-webhook", async (req, res) => {
     events.pop();
   }
 
-  // Handle call.initiated events for inbound calls
+  // Handle different event types
   if (data.event_type === "call.initiated") {
     handleInboundCall(data.payload).catch(err => {
       console.error("[Webhook] Error handling inbound call:", err.message);
     });
+  } else if (data.event_type === "call.answered") {
+    handleCallAnswered(data.payload).catch(err => {
+      console.error("[Webhook] Error handling call answered:", err.message);
+    });
+  } else if (data.event_type === "call.hangup") {
+    handleCallHangup(data.payload);
   }
 
   // Forward to command-center if URL is configured
@@ -261,6 +379,15 @@ app.get("/events/:id", (req, res) => {
   res.json({ success: true, event });
 });
 
+// Get active conferences
+app.get("/conferences", (req, res) => {
+  const confs = Array.from(activeConferences.entries()).map(([callControlId, info]) => ({
+    elevenLabsCallControlId: callControlId,
+    ...info,
+  }));
+  res.json({ success: true, conferences: confs });
+});
+
 // Clear events (for testing)
 app.delete("/events", (req, res) => {
   events.length = 0;
@@ -271,6 +398,7 @@ app.listen(PORT, () => {
   console.log(`Personal Agent Webhook server running on port ${PORT}`);
   console.log(`Webhook endpoint: POST /telnyx-webhook`);
   console.log(`Events endpoint: GET /events`);
+  console.log(`Conferences endpoint: GET /conferences`);
   if (process.env.TELNYX_API_KEY) {
     console.log(`Telnyx API key configured - will handle inbound calls`);
   } else {
