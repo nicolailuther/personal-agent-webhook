@@ -9,3 +9,7 @@ services:
         value: production
       - key: FORWARD_WEBHOOK_URL
         sync: false
+      - key: TELNYX_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
