@@ -26,19 +26,13 @@ const activeConferences = new Map();
 const pendingAICallbacks = new Map();
 
 // Agent phone numbers and their ElevenLabs config
-// Both numbers now route to our Call Control App for monitoring
+// Executive Assistant routes through Call Control App for monitoring
 const AGENT_PHONE_NUMBERS = {
   "+18635008639": {
     phoneNumberId: "phnum_2601kgh5cqwkf3x89a64gftmggda",
     agentId: "agent_1201kgh4q7abf8n8zvfewvwyqr1e",
     agentName: "Executive Assistant",
-    bridgeNumber: "+13159298140", // Use the OTHER number as bridge
-  },
-  "+13159298140": {
-    phoneNumberId: "phnum_5701kgd89m62ezgsh60d29qtw80h",
-    agentId: "agent_0001kg7n02e7f25bmtnb07arbmjy",
-    agentName: "Jayson",
-    bridgeNumber: "+18635008639", // Use the OTHER number as bridge
+    bridgeNumber: "+18638387141", // Bridge to user's personal phone
   },
 };
 
