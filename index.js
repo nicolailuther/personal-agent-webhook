@@ -77,9 +77,10 @@ async function answerCall(callControlId) {
 }
 
 /**
- * Create a conference
+ * Create a conference with an initial call
+ * Telnyx requires a call_control_id to create a conference (auto-joins that call)
  */
-async function createConference(name) {
+async function createConference(name, callControlId) {
   const apiKey = process.env.TELNYX_API_KEY;
   if (!apiKey) return { success: false, error: "No API key" };
 
@@ -95,6 +96,7 @@ async function createConference(name) {
         body: JSON.stringify({
           name: name,
           beep_enabled: "never",
+          call_control_id: callControlId,
         }),
       }
     );
@@ -222,22 +224,16 @@ async function handleInboundCall(payload) {
     return;
   }
 
-  // Step 2: Create a conference
+  // Step 2: Create conference with caller already joined
+  // Telnyx requires call_control_id to create conference (auto-joins that call)
   const confName = `call_${Date.now()}`;
-  console.log(`[Webhook] Creating conference: ${confName}`);
-  const confResult = await createConference(confName);
+  console.log(`[Webhook] Creating conference: ${confName} with caller`);
+  const confResult = await createConference(confName, callControlId);
   if (!confResult.success) {
     console.error(`[Webhook] Failed to create conference: ${confResult.error}`);
     return;
   }
-
-  // Step 3: Join caller to conference
-  console.log(`[Webhook] Joining caller to conference...`);
-  const joinResult = await joinConference(confResult.conferenceId, callControlId);
-  if (!joinResult.success) {
-    console.error(`[Webhook] Failed to join caller to conference: ${joinResult.error}`);
-    return;
-  }
+  console.log(`[Webhook] Conference created, caller auto-joined: ${confResult.conferenceId}`);
 
   // Step 4: Dial ElevenLabs
   console.log(`[Webhook] Dialing ElevenLabs ${agentConfig.agentName}...`);
