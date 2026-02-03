@@ -28,8 +28,8 @@ const AGENT_PHONE_NUMBERS = {
   },
 };
 
-// Connection ID for outbound calls
-const OUTBOUND_CONNECTION_ID = "2883735034622117580";
+// Connection ID for outbound calls (Call Control Application with webhook URL configured)
+const OUTBOUND_CONNECTION_ID = "2887328154249069899";
 
 app.use(cors());
 app.use(express.json());
