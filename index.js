@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
