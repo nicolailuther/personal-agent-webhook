@@ -80,6 +80,10 @@ app.get("/debug", (req, res) => {
   res.json({
     version: VERSION,
     deploy_time: DEPLOY_TIME,
+    config: {
+      hasTelnyxKey: !!process.env.TELNYX_API_KEY,
+      hasElevenLabsKey: !!process.env.ELEVENLABS_API_KEY,
+    },
     pending_calls: Array.from(pendingCalls.entries()),
     active_conferences: Array.from(activeConferences.entries()),
     pending_ai_callbacks: Array.from(pendingAICallbacks.entries()),
