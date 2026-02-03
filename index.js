@@ -158,25 +158,8 @@ async function handleInboundCall(payload) {
 
   console.log(`[Webhook] Inbound call from ${from} to ${agentConfig.agentName} (${to})`);
 
-  // Answer the call
-  console.log(`[Webhook] Answering call...`);
-  const answerResult = await answerCall(callControlId);
-  if (!answerResult.success) {
-    console.error(`[Webhook] Failed to answer call: ${answerResult.error}`);
-    return;
-  }
-
-  // Small delay to ensure call is fully answered
-  await new Promise(resolve => setTimeout(resolve, 300));
-
-  // Play brief hold message
-  console.log(`[Webhook] Playing hold message...`);
-  await speakMessage(callControlId, "One moment please.");
-
-  // Wait for message to complete
-  await new Promise(resolve => setTimeout(resolve, 1500));
-
-  // Transfer to ElevenLabs
+  // Transfer directly to ElevenLabs without answering
+  // This keeps the caller hearing ring tone until ElevenLabs answers
   console.log(`[Webhook] Transferring to ElevenLabs ${agentConfig.agentName}...`);
   const transferResult = await transferToElevenLabsSIP(callControlId, agentConfig.phoneNumberId);
   if (!transferResult.success) {
