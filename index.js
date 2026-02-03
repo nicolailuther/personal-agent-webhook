@@ -8,10 +8,18 @@ const PORT = process.env.PORT || 3001;
 const events = [];
 const MAX_EVENTS = 100;
 
-// Agent phone numbers and their ElevenLabs phone_number_ids
+// Agent phone numbers and their ElevenLabs config
 const AGENT_PHONE_NUMBERS = {
-  "+18635008639": { phoneNumberId: "phnum_2601kgh5cqwkf3x89a64gftmggda", agentName: "Executive Assistant" },
-  "+13159298140": { phoneNumberId: "phnum_5701kgd89m62ezgsh60d29qtw80h", agentName: "Jayson" },
+  "+18635008639": {
+    phoneNumberId: "phnum_2601kgh5cqwkf3x89a64gftmggda",
+    agentId: "agent_1201kgh4q7abf8n8zvfewvwyqr1e",
+    agentName: "Executive Assistant"
+  },
+  "+13159298140": {
+    phoneNumberId: "phnum_5701kgd89m62ezgsh60d29qtw80h",
+    agentId: "agent_0001kg7n02e7f25bmtnb07arbmjy",
+    agentName: "Jayson"
+  },
 };
 
 app.use(cors());
@@ -100,7 +108,7 @@ async function speakMessage(callControlId, message) {
 /**
  * Transfer call to ElevenLabs via SIP
  */
-async function transferToElevenLabsSIP(callControlId, phoneNumberId) {
+async function transferToElevenLabsSIP(callControlId, phoneNumberId, agentId, phoneNumber) {
   const apiKey = process.env.TELNYX_API_KEY;
   if (!apiKey) {
     console.error("[Telnyx] No API key configured");
@@ -108,8 +116,9 @@ async function transferToElevenLabsSIP(callControlId, phoneNumberId) {
   }
 
   try {
-    // ElevenLabs SIP endpoint format
-    const sipUri = `sip:${phoneNumberId}@sip.rtc.elevenlabs.io:5061;transport=tls`;
+    // Try using the phone number in the SIP URI (E.164 format without +)
+    const phoneDigits = phoneNumber.replace('+', '');
+    const sipUri = `sip:${phoneDigits}@sip.rtc.elevenlabs.io:5061;transport=tls`;
     console.log(`[Telnyx] Transferring call ${callControlId} to ElevenLabs SIP: ${sipUri}`);
 
     const response = await fetch(
@@ -158,10 +167,17 @@ async function handleInboundCall(payload) {
 
   console.log(`[Webhook] Inbound call from ${from} to ${agentConfig.agentName} (${to})`);
 
-  // Transfer directly to ElevenLabs without answering
-  // This keeps the caller hearing ring tone until ElevenLabs answers
+  // Answer the call first (required for transfer to work properly)
+  console.log(`[Webhook] Answering call...`);
+  const answerResult = await answerCall(callControlId);
+  if (!answerResult.success) {
+    console.error(`[Webhook] Failed to answer: ${answerResult.error}`);
+    return;
+  }
+
+  // Immediately transfer to ElevenLabs (no delay, no message)
   console.log(`[Webhook] Transferring to ElevenLabs ${agentConfig.agentName}...`);
-  const transferResult = await transferToElevenLabsSIP(callControlId, agentConfig.phoneNumberId);
+  const transferResult = await transferToElevenLabsSIP(callControlId, agentConfig.phoneNumberId, agentConfig.agentId, to);
   if (!transferResult.success) {
     console.error(`[Webhook] Failed to transfer: ${transferResult.error}`);
     return;
