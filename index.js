@@ -109,7 +109,7 @@ async function handleInboundCall(payload) {
   const from = payload?.from;
   const direction = payload?.direction;
 
-  if (!callControlId || direction !== "inbound") {
+  if (!callControlId || (direction !== "inbound" && direction !== "incoming")) {
     return;
   }
 
