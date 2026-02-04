@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -14,6 +14,10 @@ const MAX_EVENTS = 100;
 
 // Debug log for operation results
 const debugLog = [];
+
+// Call history storage (persists caller info for display in Cortex)
+const callHistory = [];
+const MAX_CALL_HISTORY = 200;
 
 // Track calls pending conference setup (answered but not yet in conference)
 const pendingCalls = new Map();
@@ -284,6 +288,24 @@ async function handleCallInitiated(payload) {
     timestamp: Date.now(),
   });
 
+  // Store in call history for Cortex display
+  const historyEntry = {
+    id: `call_${Date.now()}_${callControlId.slice(-8)}`,
+    callerPhone: from,
+    agentPhone: to,
+    agentName: agentConfig.agentName,
+    direction: "inbound",
+    status: "initiated",
+    startTime: new Date().toISOString(),
+    callControlId,
+    conferenceId: null,
+    aiCallControlId: null,
+    endTime: null,
+    duration: null,
+  };
+  callHistory.unshift(historyEntry);
+  if (callHistory.length > MAX_CALL_HISTORY) callHistory.pop();
+
   // Answer the call
   console.log(`[Webhook] Answering call...`);
   const answerResult = await answerCall(callControlId);
@@ -339,6 +361,12 @@ async function handleCallAnswered(payload) {
               conferenceId: clientState.conferenceId,
               callerFrom: clientState.callerFrom,
             });
+            // Update call history with AI connection
+            const historyEntry = callHistory.find(h => h.conferenceId === clientState.conferenceId);
+            if (historyEntry) {
+              historyEntry.aiCallControlId = callControlId;
+              historyEntry.status = "connected";
+            }
             break;
           }
         }
@@ -413,6 +441,13 @@ async function handleCallAnswered(payload) {
       createdAt: new Date().toISOString(),
     });
 
+    // Update call history entry with conference info
+    const historyEntry = callHistory.find(h => h.callControlId === callControlId);
+    if (historyEntry) {
+      historyEntry.status = "in_progress";
+      historyEntry.conferenceId = confResult.conferenceId;
+    }
+
     // Dial ElevenLabs SIP endpoint
     console.log(`[Webhook] Dialing ElevenLabs SIP for ${pendingInfo.agentConfig.agentName}...`);
 
@@ -445,6 +480,22 @@ async function handleCallAnswered(payload) {
  */
 function handleCallHangup(payload) {
   const callControlId = payload?.call_control_id;
+  const endTime = new Date().toISOString();
+
+  // Update call history entry
+  const historyEntry = callHistory.find(h =>
+    h.callControlId === callControlId || h.aiCallControlId === callControlId
+  );
+  if (historyEntry && !historyEntry.endTime) {
+    historyEntry.endTime = endTime;
+    historyEntry.status = "completed";
+    // Calculate duration
+    if (historyEntry.startTime) {
+      historyEntry.duration = Math.round(
+        (new Date(endTime).getTime() - new Date(historyEntry.startTime).getTime()) / 1000
+      );
+    }
+  }
 
   if (pendingCalls.has(callControlId)) {
     console.log(`[Webhook] Pending call ended before setup`);
@@ -556,6 +607,16 @@ app.get("/conferences", (req, res) => {
     })
   );
   res.json({ success: true, conferences: confs });
+});
+
+// Get call history (for Cortex call list display)
+app.get("/call-history", (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  res.json({
+    success: true,
+    calls: callHistory.slice(0, limit),
+    total: callHistory.length,
+  });
 });
 
 // Clear events (for testing)
