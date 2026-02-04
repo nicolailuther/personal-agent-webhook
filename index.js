@@ -344,6 +344,28 @@ async function handleCallAnswered(payload) {
         }
         return;
       }
+
+      // Handle user joining a conference (from Cortex "Join" button)
+      if (clientState.type === "conference_join") {
+        console.log(`[Webhook] User answered! Joining to conference ${clientState.conference_id}`);
+        logDebug("user_join_answered", { callControlId, conferenceId: clientState.conference_id });
+
+        const joinResult = await joinConference(clientState.conference_id, callControlId);
+        logDebug("join_user_to_conference", {
+          conferenceId: clientState.conference_id,
+          callControlId,
+          success: joinResult.success,
+          error: joinResult.error,
+        });
+
+        if (!joinResult.success) {
+          console.error(`[Webhook] Failed to join user to conference: ${joinResult.error}`);
+          return;
+        }
+
+        console.log(`[Webhook] User successfully joined conference!`);
+        return;
+      }
     } catch (e) {
       // Not valid JSON client_state, continue normal flow
     }
