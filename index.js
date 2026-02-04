@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.2.0";
+const VERSION = "3.3.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -496,10 +496,11 @@ async function handleCallAnswered(payload) {
 }
 
 /**
- * Handle call.hangup - cleanup
+ * Handle call.hangup - cleanup and notify Cortex
  */
-function handleCallHangup(payload) {
+async function handleCallHangup(payload) {
   const callControlId = payload?.call_control_id;
+  const hangupCause = payload?.hangup_cause || "unknown";
   const endTime = new Date().toISOString();
 
   // Update call history entry
@@ -534,6 +535,24 @@ function handleCallHangup(payload) {
       confData.aiCallControlId = null;
       confData.aiConnected = false;
     }
+  }
+
+  // Notify Cortex that the call has ended
+  const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+  try {
+    const response = await fetch(`${cortexUrl}/api/calls/call-ended`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        call_control_id: callControlId,
+        call_id: historyEntry?.callId,
+        reason: hangupCause,
+      }),
+    });
+    const result = await response.json();
+    console.log(`[Webhook] Notified Cortex of call hangup: ${result.changes || 0} rows updated`);
+  } catch (err) {
+    console.error(`[Webhook] Failed to notify Cortex of hangup:`, err.message);
   }
 }
 
@@ -571,7 +590,9 @@ app.post("/telnyx-webhook", async (req, res) => {
       console.error("[Webhook] Error handling call answered:", err.message);
     });
   } else if (data.event_type === "call.hangup") {
-    handleCallHangup(data.payload);
+    handleCallHangup(data.payload).catch((err) => {
+      console.error("[Webhook] Error handling call hangup:", err.message);
+    });
   }
 
   // Forward to command-center if URL is configured
