@@ -417,8 +417,112 @@ async function handleCallAnswered(payload) {
 
         return;
       }
+
+      // Handle AI outbound call - contact answered, create conference and connect AI
+      if (clientState.type === "ai_outbound") {
+        const agentPhoneNumberId = clientState.agent_phone_number_id;
+        const toNumber = clientState.to_number;
+        const agentPhoneNumber = payload?.from; // The agent number we called from
+
+        console.log(`[Webhook] AI outbound call answered by ${toNumber}, creating conference...`);
+        logDebug("ai_outbound_answered", { callControlId, toNumber, agentPhoneNumber });
+
+        // Create conference with the contact's call
+        const confName = `outbound_${Date.now()}`;
+        const confResult = await createConference(confName, callControlId);
+        logDebug("create_outbound_conference", {
+          confName,
+          callControlId,
+          success: confResult.success,
+          conferenceId: confResult.conferenceId,
+          error: confResult.error,
+        });
+
+        if (!confResult.success) {
+          console.error(`[Webhook] Failed to create conference for outbound: ${confResult.error}`);
+          return;
+        }
+
+        console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
+
+        // Store conference info for join capability
+        activeConferences.set(callControlId, {
+          conferenceId: confResult.conferenceId,
+          agentName: "Executive Assistant",
+          callerFrom: toNumber,
+          callerCallControlId: callControlId,
+          agentPhoneNumber: agentPhoneNumber,
+          aiCallControlId: null,
+          aiConnected: false,
+          isOutbound: true,
+          createdAt: new Date().toISOString(),
+        });
+
+        // Store in call history
+        const historyEntry = {
+          id: `call_${Date.now()}_${callControlId.slice(-8)}`,
+          callerPhone: toNumber,
+          agentPhone: agentPhoneNumber,
+          agentName: "Executive Assistant",
+          direction: "outbound",
+          status: "in_progress",
+          startTime: new Date().toISOString(),
+          callControlId,
+          conferenceId: confResult.conferenceId,
+          aiCallControlId: null,
+          endTime: null,
+          duration: null,
+        };
+        callHistory.unshift(historyEntry);
+        if (callHistory.length > MAX_CALL_HISTORY) callHistory.pop();
+
+        // Dial ElevenLabs SIP to connect AI
+        console.log(`[Webhook] Dialing ElevenLabs SIP for outbound call...`);
+        const sipResult = await dialElevenLabsSIP(
+          agentPhoneNumber,
+          confResult.conferenceId,
+          toNumber
+        );
+
+        logDebug("dial_elevenlabs_sip_outbound", {
+          agentPhoneNumber,
+          conferenceId: confResult.conferenceId,
+          success: sipResult.success,
+          aiCallControlId: sipResult.callControlId,
+          error: sipResult.error,
+        });
+
+        if (!sipResult.success) {
+          console.error(`[Webhook] Failed to dial ElevenLabs SIP: ${sipResult.error}`);
+          return;
+        }
+
+        console.log(`[Webhook] ElevenLabs SIP call initiated for outbound. Waiting for AI to answer...`);
+
+        // Notify Cortex that outbound call is now connected
+        const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+        const webhookSecret = process.env.INTERNAL_WEBHOOK_SECRET;
+        const headers = { "Content-Type": "application/json" };
+        if (webhookSecret) headers["x-webhook-secret"] = webhookSecret;
+        fetch(`${cortexUrl}/api/calls/outbound-connected`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            call_control_id: callControlId,
+            conference_id: confResult.conferenceId,
+            to_number: toNumber,
+          }),
+        }).then(res => {
+          console.log(`[Webhook] Notified Cortex of outbound connection: ${res.status}`);
+        }).catch(err => {
+          console.error(`[Webhook] Failed to notify Cortex: ${err.message}`);
+        });
+
+        return;
+      }
     } catch (e) {
       // Not valid JSON client_state, continue normal flow
+      console.log(`[Webhook] Error parsing client_state: ${e.message}`);
     }
   }
 
