@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -27,6 +27,9 @@ const activeConferences = new Map();
 
 // Track AI legs by call_control_id (for matching call.answered events)
 const pendingAILegs = new Map();
+
+// Live transcripts storage (conferenceId -> array of transcript entries)
+const liveTranscripts = new Map();
 
 // Agent phone numbers and their ElevenLabs config
 const AGENT_PHONE_NUMBERS = {
@@ -188,6 +191,50 @@ async function joinConference(conferenceId, callControlId) {
     return { success: true };
   } catch (error) {
     console.error("[Telnyx] Error joining conference:", error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Start transcription on a conference
+ * This enables real-time speech-to-text for all participants
+ */
+async function startTranscription(conferenceId) {
+  const apiKey = process.env.TELNYX_API_KEY;
+  if (!apiKey) return { success: false, error: "No API key" };
+
+  try {
+    console.log(`[Telnyx] Starting transcription for conference ${conferenceId}`);
+    const response = await fetch(
+      `https://api.telnyx.com/v2/conferences/${conferenceId}/actions/start_transcription`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          language: "en",
+          transcription_tracks: "inbound",
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      const errorMsg = errorData.errors?.[0]?.detail || `API error: ${response.status}`;
+      console.error(`[Telnyx] Transcription start failed: ${errorMsg}`);
+      throw new Error(errorMsg);
+    }
+
+    console.log(`[Telnyx] Transcription started for conference ${conferenceId}`);
+
+    // Initialize transcript storage for this conference
+    liveTranscripts.set(conferenceId, []);
+
+    return { success: true };
+  } catch (error) {
+    console.error("[Telnyx] Error starting transcription:", error.message);
     return { success: false, error: error.message };
   }
 }
@@ -445,6 +492,15 @@ async function handleCallAnswered(payload) {
 
         console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
 
+        // Start transcription for live transcript feature
+        startTranscription(confResult.conferenceId).then(result => {
+          if (result.success) {
+            console.log(`[Webhook] Transcription started for outbound conference`);
+          } else {
+            console.log(`[Webhook] Transcription start failed: ${result.error}`);
+          }
+        });
+
         // Store conference info for join capability
         activeConferences.set(callControlId, {
           conferenceId: confResult.conferenceId,
@@ -556,6 +612,15 @@ async function handleCallAnswered(payload) {
 
     console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
 
+    // Start transcription for live transcript feature
+    startTranscription(confResult.conferenceId).then(result => {
+      if (result.success) {
+        console.log(`[Webhook] Transcription started for inbound conference`);
+      } else {
+        console.log(`[Webhook] Transcription start failed: ${result.error}`);
+      }
+    });
+
     // Store conference info
     activeConferences.set(callControlId, {
       conferenceId: confResult.conferenceId,
@@ -603,6 +668,70 @@ async function handleCallAnswered(payload) {
 }
 
 /**
+ * Handle conference.transcription - store and forward live transcripts
+ */
+async function handleTranscription(payload) {
+  const conferenceId = payload?.conference_id;
+  const transcriptionText = payload?.transcription_data?.transcript;
+  const isFinal = payload?.transcription_data?.is_final;
+  const participantCallControlId = payload?.call_control_id;
+
+  if (!conferenceId || !transcriptionText) return;
+
+  console.log(`[Webhook] Transcription: ${transcriptionText} (final: ${isFinal})`);
+
+  // Determine speaker (AI or Contact)
+  let speaker = "Contact";
+  for (const [, confData] of activeConferences.entries()) {
+    if (confData.conferenceId === conferenceId) {
+      if (confData.aiCallControlId === participantCallControlId) {
+        speaker = "AI";
+      }
+      break;
+    }
+  }
+
+  const transcriptEntry = {
+    id: `tr_${Date.now()}`,
+    timestamp: new Date().toISOString(),
+    speaker,
+    text: transcriptionText,
+    isFinal,
+    callControlId: participantCallControlId,
+  };
+
+  // Store locally
+  if (!liveTranscripts.has(conferenceId)) {
+    liveTranscripts.set(conferenceId, []);
+  }
+  const transcripts = liveTranscripts.get(conferenceId);
+
+  // Only keep final transcripts or update the latest interim
+  if (isFinal) {
+    transcripts.push(transcriptEntry);
+    // Keep max 500 entries per conference
+    if (transcripts.length > 500) transcripts.shift();
+  }
+
+  // Forward to Cortex
+  const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+  const webhookSecret = process.env.INTERNAL_WEBHOOK_SECRET;
+  const headers = { "Content-Type": "application/json" };
+  if (webhookSecret) headers["x-webhook-secret"] = webhookSecret;
+
+  fetch(`${cortexUrl}/api/calls/transcript`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      conference_id: conferenceId,
+      transcript: transcriptEntry,
+    }),
+  }).catch(err => {
+    console.error(`[Webhook] Failed to forward transcript: ${err.message}`);
+  });
+}
+
+/**
  * Handle call.hangup - cleanup and notify Cortex
  */
 async function handleCallHangup(payload) {
@@ -631,7 +760,15 @@ async function handleCallHangup(payload) {
   }
 
   if (activeConferences.has(callControlId)) {
+    const confData = activeConferences.get(callControlId);
     console.log(`[Webhook] Call ended, cleaning up conference tracking`);
+    // Clean up transcripts after a delay (keep for 5 minutes for retrieval)
+    if (confData?.conferenceId) {
+      setTimeout(() => {
+        liveTranscripts.delete(confData.conferenceId);
+        console.log(`[Webhook] Cleaned up transcripts for conference ${confData.conferenceId}`);
+      }, 5 * 60 * 1000);
+    }
     activeConferences.delete(callControlId);
   }
 
@@ -703,6 +840,10 @@ app.post("/telnyx-webhook", async (req, res) => {
     handleCallHangup(data.payload).catch((err) => {
       console.error("[Webhook] Error handling call hangup:", err.message);
     });
+  } else if (data.event_type === "conference.transcription") {
+    handleTranscription(data.payload).catch((err) => {
+      console.error("[Webhook] Error handling transcription:", err.message);
+    });
   }
 
   // Forward to command-center if URL is configured
@@ -761,6 +902,25 @@ app.get("/conferences", (req, res) => {
     })
   );
   res.json({ success: true, conferences: confs });
+});
+
+// Get live transcripts for a conference
+app.get("/transcripts/:conferenceId", (req, res) => {
+  const conferenceId = req.params.conferenceId;
+  const transcripts = liveTranscripts.get(conferenceId) || [];
+  const since = req.query.since ? new Date(req.query.since) : null;
+
+  let filtered = transcripts;
+  if (since) {
+    filtered = transcripts.filter(t => new Date(t.timestamp) > since);
+  }
+
+  res.json({
+    success: true,
+    conferenceId,
+    transcripts: filtered,
+    total: transcripts.length,
+  });
 });
 
 // Get call history (for Cortex call list display)
