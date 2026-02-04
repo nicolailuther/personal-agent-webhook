@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -395,11 +395,14 @@ async function handleCallAnswered(payload) {
 
         // Notify Cortex that user has joined (so "Take Over" button appears)
         const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+        const webhookSecret = process.env.INTERNAL_WEBHOOK_SECRET;
         const originalCallId = clientState.original_call_id;
         if (originalCallId) {
+          const headers = { "Content-Type": "application/json" };
+          if (webhookSecret) headers["x-webhook-secret"] = webhookSecret;
           fetch(`${cortexUrl}/api/calls/user-joined`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers,
             body: JSON.stringify({
               call_id: originalCallId,
               conference_id: clientState.conference_id,
@@ -539,10 +542,13 @@ async function handleCallHangup(payload) {
 
   // Notify Cortex that the call has ended
   const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+  const webhookSecret = process.env.INTERNAL_WEBHOOK_SECRET;
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (webhookSecret) headers["x-webhook-secret"] = webhookSecret;
     const response = await fetch(`${cortexUrl}/api/calls/call-ended`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         call_control_id: callControlId,
         call_id: historyEntry?.callId,
@@ -598,9 +604,12 @@ app.post("/telnyx-webhook", async (req, res) => {
   // Forward to command-center if URL is configured
   const forwardUrl = process.env.FORWARD_WEBHOOK_URL;
   if (forwardUrl) {
+    const fwdHeaders = { "Content-Type": "application/json" };
+    const fwdSecret = process.env.INTERNAL_WEBHOOK_SECRET;
+    if (fwdSecret) fwdHeaders["x-webhook-secret"] = fwdSecret;
     fetch(forwardUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: fwdHeaders,
       body: JSON.stringify(req.body),
     }).catch((err) => console.error("[Forward] Error:", err.message));
   }
