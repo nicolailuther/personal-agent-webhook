@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.5.0";
+const VERSION = "3.5.1";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -201,10 +201,22 @@ async function joinConference(conferenceId, callControlId) {
  */
 async function startTranscription(conferenceId) {
   const apiKey = process.env.TELNYX_API_KEY;
-  if (!apiKey) return { success: false, error: "No API key" };
+  if (!apiKey) {
+    logDebug("start_transcription", { conferenceId, success: false, error: "No API key" });
+    return { success: false, error: "No API key" };
+  }
 
   try {
     console.log(`[Telnyx] Starting transcription for conference ${conferenceId}`);
+
+    // Build request body - transcription events will come to our webhook
+    const requestBody = {
+      language: "en",
+      transcription_tracks: "inbound",  // Transcribe all incoming audio to the conference
+    };
+
+    console.log(`[Telnyx] Transcription request:`, JSON.stringify(requestBody));
+
     const response = await fetch(
       `https://api.telnyx.com/v2/conferences/${conferenceId}/actions/start_transcription`,
       {
@@ -213,21 +225,26 @@ async function startTranscription(conferenceId) {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          language: "en",
-          transcription_tracks: "inbound",
-        }),
+        body: JSON.stringify(requestBody),
       }
     );
 
+    const responseText = await response.text();
+    console.log(`[Telnyx] Transcription response (${response.status}):`, responseText);
+
     if (!response.ok) {
-      const errorData = await response.json();
-      const errorMsg = errorData.errors?.[0]?.detail || `API error: ${response.status}`;
+      let errorMsg = `API error: ${response.status}`;
+      try {
+        const errorData = JSON.parse(responseText);
+        errorMsg = errorData.errors?.[0]?.detail || errorMsg;
+      } catch (e) {}
       console.error(`[Telnyx] Transcription start failed: ${errorMsg}`);
+      logDebug("start_transcription", { conferenceId, success: false, error: errorMsg });
       throw new Error(errorMsg);
     }
 
     console.log(`[Telnyx] Transcription started for conference ${conferenceId}`);
+    logDebug("start_transcription", { conferenceId, success: true });
 
     // Initialize transcript storage for this conference
     liveTranscripts.set(conferenceId, []);
@@ -235,6 +252,7 @@ async function startTranscription(conferenceId) {
     return { success: true };
   } catch (error) {
     console.error("[Telnyx] Error starting transcription:", error.message);
+    logDebug("start_transcription", { conferenceId, success: false, error: error.message });
     return { success: false, error: error.message };
   }
 }
