@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.5.1";
+const VERSION = "3.5.2";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -510,15 +510,6 @@ async function handleCallAnswered(payload) {
 
         console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
 
-        // Start transcription for live transcript feature
-        startTranscription(confResult.conferenceId).then(result => {
-          if (result.success) {
-            console.log(`[Webhook] Transcription started for outbound conference`);
-          } else {
-            console.log(`[Webhook] Transcription start failed: ${result.error}`);
-          }
-        });
-
         // Store conference info for join capability
         activeConferences.set(callControlId, {
           conferenceId: confResult.conferenceId,
@@ -629,15 +620,6 @@ async function handleCallAnswered(payload) {
     }
 
     console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
-
-    // Start transcription for live transcript feature
-    startTranscription(confResult.conferenceId).then(result => {
-      if (result.success) {
-        console.log(`[Webhook] Transcription started for inbound conference`);
-      } else {
-        console.log(`[Webhook] Transcription start failed: ${result.error}`);
-      }
-    });
 
     // Store conference info
     activeConferences.set(callControlId, {
