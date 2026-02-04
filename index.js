@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -392,6 +392,26 @@ async function handleCallAnswered(payload) {
         }
 
         console.log(`[Webhook] User successfully joined conference!`);
+
+        // Notify Cortex that user has joined (so "Take Over" button appears)
+        const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+        const originalCallId = clientState.original_call_id;
+        if (originalCallId) {
+          fetch(`${cortexUrl}/api/calls/user-joined`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              call_id: originalCallId,
+              conference_id: clientState.conference_id,
+              user_call_control_id: callControlId,
+            }),
+          }).then(res => {
+            console.log(`[Webhook] Notified Cortex of user join: ${res.status}`);
+          }).catch(err => {
+            console.error(`[Webhook] Failed to notify Cortex: ${err.message}`);
+          });
+        }
+
         return;
       }
     } catch (e) {
