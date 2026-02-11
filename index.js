@@ -1072,6 +1072,51 @@ app.get("/conferences", (req, res) => {
   res.json({ success: true, conferences: confs });
 });
 
+// Re-dial ElevenLabs AI into an existing conference (for "Resume AI" after Take Over)
+app.post("/redial-ai", async (req, res) => {
+  const { conference_id, agent_phone_number, caller_phone, webhook_secret } = req.body;
+
+  // Verify shared secret
+  const secret = process.env.INTERNAL_WEBHOOK_SECRET;
+  if (secret && webhook_secret !== secret) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+
+  if (!conference_id || !agent_phone_number) {
+    return res.status(400).json({ success: false, error: "conference_id and agent_phone_number required" });
+  }
+
+  console.log(`[Redial AI] Re-dialing ElevenLabs SIP into conference ${conference_id}`);
+
+  const sipResult = await dialElevenLabsSIP(agent_phone_number, conference_id, caller_phone || "unknown");
+  logDebug("redial_ai_sip", {
+    conference_id,
+    agent_phone_number,
+    success: sipResult.success,
+    aiCallControlId: sipResult.callControlId,
+    error: sipResult.error,
+  });
+
+  if (!sipResult.success) {
+    return res.status(500).json({ success: false, error: sipResult.error });
+  }
+
+  // Update activeConferences with new AI call control ID
+  for (const [key, conf] of activeConferences.entries()) {
+    if (conf.conferenceId === conference_id) {
+      conf.aiCallControlId = sipResult.callControlId;
+      conf.aiConnected = false; // Will be set to true when AI answers
+      break;
+    }
+  }
+
+  res.json({
+    success: true,
+    ai_call_control_id: sipResult.callControlId,
+    message: "AI re-dialed into conference",
+  });
+});
+
 // Get live transcripts for a conference
 app.get("/transcripts/:conferenceId", (req, res) => {
   const conferenceId = req.params.conferenceId;
