@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.6.0";
+const VERSION = "3.6.1";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -27,6 +27,9 @@ const activeConferences = new Map();
 
 // Track AI legs by call_control_id (for matching call.answered events)
 const pendingAILegs = new Map();
+
+// Track outbound AI calls (call.initiated → call.answered matching when client_state is null)
+const pendingOutboundCalls = new Map();
 
 // Live transcripts storage (conferenceId -> array of transcript entries)
 const liveTranscripts = new Map();
@@ -67,6 +70,7 @@ app.get("/", (req, res) => {
     pending_calls: pendingCalls.size,
     active_conferences: activeConferences.size,
     pending_ai_legs: pendingAILegs.size,
+    pending_outbound_calls: pendingOutboundCalls.size,
     timestamp: new Date().toISOString(),
   });
 });
@@ -82,6 +86,7 @@ app.get("/debug", (req, res) => {
     pending_calls: Array.from(pendingCalls.entries()),
     active_conferences: Array.from(activeConferences.entries()),
     pending_ai_legs: Array.from(pendingAILegs.entries()),
+    pending_outbound_calls: Array.from(pendingOutboundCalls.entries()),
     recent_operations: debugLog.slice(0, 20),
   });
 });
@@ -330,8 +335,25 @@ async function handleCallInitiated(payload) {
   const from = payload?.from;
   const direction = payload?.direction;
 
-  // Only handle inbound calls
-  if (!callControlId || (direction !== "inbound" && direction !== "incoming")) {
+  if (!callControlId) return;
+
+  // Track outbound calls from agent numbers (for fallback matching in call.answered)
+  if (direction === "outgoing" && from) {
+    const agentConfig = AGENT_PHONE_NUMBERS[from];
+    const isSipCall = to && (to.includes("sip.rtc.elevenlabs.io") || to.startsWith("sip:"));
+    if (agentConfig && !isSipCall) {
+      console.log(`[Webhook] Tracking outbound AI call from ${from} to ${to}`);
+      pendingOutboundCalls.set(callControlId, {
+        from,
+        to,
+        agentConfig,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  // Only handle inbound calls for auto-answer
+  if (direction !== "inbound" && direction !== "incoming") {
     return;
   }
 
@@ -591,15 +613,14 @@ async function handleCallAnswered(payload) {
     }
   }
 
-  // Fallback: Identify outbound AI calls when client_state is null
-  // Match by: outgoing direction + from an agent phone number + to a real phone (not SIP)
-  if (payload?.direction === "outgoing" && payload?.from && payload?.to) {
-    const agentConfig = AGENT_PHONE_NUMBERS[payload.from];
-    const isSipCall = payload.to.includes("sip.rtc.elevenlabs.io") || payload.to.startsWith("sip:");
-
-    if (agentConfig && !isSipCall) {
-      const agentPhoneNumber = payload.from;
-      const toNumber = payload.to;
+  // Fallback: Match outbound AI calls tracked from call.initiated
+  const pendingOutbound = pendingOutboundCalls.get(callControlId);
+  if (pendingOutbound) {
+    pendingOutboundCalls.delete(callControlId);
+    {
+      const agentPhoneNumber = pendingOutbound.from;
+      const toNumber = pendingOutbound.to;
+      const agentConfig = pendingOutbound.agentConfig;
 
       console.log(`[Webhook] AI outbound call answered by ${toNumber} (fallback: matched agent number ${agentPhoneNumber})`);
       logDebug("ai_outbound_answered_fallback", { callControlId, toNumber, agentPhoneNumber });
