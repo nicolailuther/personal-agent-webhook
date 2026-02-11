@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.5.2";
+const VERSION = "3.6.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
@@ -591,6 +591,119 @@ async function handleCallAnswered(payload) {
     }
   }
 
+  // Fallback: Identify outbound AI calls when client_state is null
+  // Match by: outgoing direction + from an agent phone number + to a real phone (not SIP)
+  if (payload?.direction === "outgoing" && payload?.from && payload?.to) {
+    const agentConfig = AGENT_PHONE_NUMBERS[payload.from];
+    const isSipCall = payload.to.includes("sip.rtc.elevenlabs.io") || payload.to.startsWith("sip:");
+
+    if (agentConfig && !isSipCall) {
+      const agentPhoneNumber = payload.from;
+      const toNumber = payload.to;
+
+      console.log(`[Webhook] AI outbound call answered by ${toNumber} (fallback: matched agent number ${agentPhoneNumber})`);
+      logDebug("ai_outbound_answered_fallback", { callControlId, toNumber, agentPhoneNumber });
+
+      // Create conference with the contact's call
+      const confName = `outbound_${Date.now()}`;
+      const confResult = await createConference(confName, callControlId);
+      logDebug("create_outbound_conference", {
+        confName,
+        callControlId,
+        success: confResult.success,
+        conferenceId: confResult.conferenceId,
+        error: confResult.error,
+      });
+
+      if (!confResult.success) {
+        console.error(`[Webhook] Failed to create conference for outbound: ${confResult.error}`);
+        return;
+      }
+
+      console.log(`[Webhook] Conference created: ${confResult.conferenceId}`);
+
+      // Store conference info for join capability
+      activeConferences.set(callControlId, {
+        conferenceId: confResult.conferenceId,
+        agentName: agentConfig.agentName,
+        callerFrom: toNumber,
+        callerCallControlId: callControlId,
+        agentPhoneNumber: agentPhoneNumber,
+        aiCallControlId: null,
+        aiConnected: false,
+        isOutbound: true,
+        createdAt: new Date().toISOString(),
+      });
+
+      // Store in call history
+      const historyEntry = {
+        id: `call_${Date.now()}_${callControlId.slice(-8)}`,
+        callerPhone: toNumber,
+        agentPhone: agentPhoneNumber,
+        agentName: agentConfig.agentName,
+        direction: "outbound",
+        status: "in_progress",
+        startTime: new Date().toISOString(),
+        callControlId,
+        conferenceId: confResult.conferenceId,
+        aiCallControlId: null,
+        endTime: null,
+        duration: null,
+      };
+      callHistory.unshift(historyEntry);
+      if (callHistory.length > MAX_CALL_HISTORY) callHistory.pop();
+
+      // Dial ElevenLabs SIP to connect AI
+      console.log(`[Webhook] Dialing ElevenLabs SIP for outbound call...`);
+      const sipResult = await dialElevenLabsSIP(
+        agentPhoneNumber,
+        confResult.conferenceId,
+        toNumber
+      );
+
+      logDebug("dial_elevenlabs_sip_outbound", {
+        agentPhoneNumber,
+        conferenceId: confResult.conferenceId,
+        success: sipResult.success,
+        aiCallControlId: sipResult.callControlId,
+        error: sipResult.error,
+      });
+
+      if (!sipResult.success) {
+        console.error(`[Webhook] Failed to dial ElevenLabs SIP: ${sipResult.error}`);
+        return;
+      }
+
+      console.log(`[Webhook] ElevenLabs SIP call initiated for outbound. Waiting for AI to answer...`);
+
+      // Notify Cortex that outbound call is now connected
+      const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
+      const webhookSecret = process.env.INTERNAL_WEBHOOK_SECRET;
+      const headers = { "Content-Type": "application/json" };
+      if (webhookSecret) headers["x-webhook-secret"] = webhookSecret;
+      fetch(`${cortexUrl}/api/calls/outbound-connected`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          call_control_id: callControlId,
+          conference_id: confResult.conferenceId,
+          to_number: toNumber,
+        }),
+      }).then(res => {
+        console.log(`[Webhook] Notified Cortex of outbound connection: ${res.status}`);
+      }).catch(err => {
+        console.error(`[Webhook] Failed to notify Cortex: ${err.message}`);
+      });
+
+      // Start transcription for the conference
+      startTranscription(confResult.conferenceId).catch(err => {
+        console.error(`[Webhook] Failed to start transcription: ${err.message}`);
+      });
+
+      return;
+    }
+  }
+
   // Check if this is an inbound call pending conference setup
   const pendingInfo = pendingCalls.get(callControlId);
   logDebug("call_answered_check", {
@@ -891,6 +1004,31 @@ app.get("/events/:id", (req, res) => {
     return res.status(404).json({ error: "Event not found" });
   }
   res.json({ success: true, event });
+});
+
+// Register dynamic CORTEX_URL (called by cortex app on startup)
+app.post("/register", (req, res) => {
+  const { cortex_url, webhook_secret } = req.body;
+
+  // Verify shared secret
+  const secret = process.env.INTERNAL_WEBHOOK_SECRET;
+  if (secret && webhook_secret !== secret) {
+    return res.status(401).json({ success: false, error: "Unauthorized" });
+  }
+
+  if (!cortex_url) {
+    return res.status(400).json({ success: false, error: "cortex_url required" });
+  }
+
+  process.env.CORTEX_URL = cortex_url;
+  console.log(`[Register] CORTEX_URL updated to: ${cortex_url}`);
+  logDebug("register_cortex_url", { cortex_url });
+
+  res.json({
+    success: true,
+    cortex_url: process.env.CORTEX_URL,
+    message: "CORTEX_URL updated",
+  });
 });
 
 // Get active conferences
