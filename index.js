@@ -480,6 +480,15 @@ async function handleCallAnswered(payload) {
 
         console.log(`[Webhook] User successfully joined conference!`);
 
+        // Update activeConferences to mark user as joined (so Cortex polling can detect it)
+        for (const [key, conf] of activeConferences.entries()) {
+          if (conf.conferenceId === clientState.conference_id) {
+            conf.userJoined = true;
+            conf.userCallControlId = callControlId;
+            break;
+          }
+        }
+
         // Notify Cortex that user has joined (so "Take Over" button appears)
         const cortexUrl = process.env.CORTEX_URL || "https://command-center-five.vercel.app";
         const webhookSecret = process.env.INTERNAL_WEBHOOK_SECRET;
