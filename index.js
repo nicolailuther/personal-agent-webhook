@@ -1,16 +1,22 @@
 const express = require("express");
 const cors = require("cors");
+const Stripe = require("stripe");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Version for tracking deploys
-const VERSION = "3.6.1";
+const VERSION = "3.7.0";
 const DEPLOY_TIME = new Date().toISOString();
 
 // Store recent events (in-memory, max 100)
 const events = [];
 const MAX_EVENTS = 100;
+
+// Stripe webhook event queue (in-memory, max 500, 24h TTL)
+const stripeEvents = [];
+const MAX_STRIPE_EVENTS = 500;
+const STRIPE_EVENT_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // Debug log for operation results
 const debugLog = [];
@@ -45,7 +51,102 @@ const AGENT_PHONE_NUMBERS = {
 const OUTBOUND_CONNECTION_ID = "2887328154249069899";
 
 app.use(cors());
+
+// Stripe webhook needs raw body for signature verification — must come before express.json()
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error("[Stripe Relay] No STRIPE_WEBHOOK_SECRET configured");
+    return res.status(500).json({ error: "Webhook secret not configured" });
+  }
+
+  let event;
+  try {
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "unused", { apiVersion: "2024-12-18.acacia" });
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error("[Stripe Relay] Signature verification failed:", err.message);
+    return res.status(400).json({ error: "Invalid signature" });
+  }
+
+  console.log(`[Stripe Relay] Received event: ${event.type} (${event.id})`);
+
+  // Store event in queue
+  stripeEvents.push({
+    id: event.id,
+    type: event.type,
+    data: event.data,
+    created: event.created,
+    received_at: new Date().toISOString(),
+  });
+
+  // Cap queue size
+  while (stripeEvents.length > MAX_STRIPE_EVENTS) {
+    stripeEvents.shift();
+  }
+
+  res.json({ received: true });
+});
+
+// Polling endpoint for local Robyn app to fetch Stripe events
+app.get("/stripe-events", (req, res) => {
+  // Auth check
+  const secret = process.env.INTERNAL_WEBHOOK_SECRET;
+  const providedSecret = req.headers["x-webhook-secret"] || req.query.secret;
+  if (secret && providedSecret !== secret) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const since = req.query.since; // Last event ID the client has seen
+
+  // Clean up old events (>24h)
+  const now = Date.now();
+  while (stripeEvents.length > 0 && new Date(stripeEvents[0].received_at).getTime() < now - STRIPE_EVENT_TTL_MS) {
+    stripeEvents.shift();
+  }
+
+  let result = stripeEvents;
+  if (since) {
+    const idx = stripeEvents.findIndex(e => e.id === since);
+    if (idx >= 0) {
+      result = stripeEvents.slice(idx + 1);
+    }
+    // If not found, return all (client may have missed events)
+  }
+
+  res.json({
+    success: true,
+    count: result.length,
+    events: result,
+  });
+});
+
 app.use(express.json());
+
+// Periodic cleanup of stale tracking data (every 5 minutes)
+setInterval(() => {
+  const now = Date.now();
+  const STALE_MS = 5 * 60 * 1000; // 5 minutes
+
+  let cleaned = 0;
+  for (const [id, info] of pendingOutboundCalls.entries()) {
+    if (now - info.timestamp > STALE_MS) {
+      pendingOutboundCalls.delete(id);
+      cleaned++;
+    }
+  }
+  for (const [id, info] of pendingCalls.entries()) {
+    if (now - info.timestamp > STALE_MS) {
+      pendingCalls.delete(id);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    console.log(`[Cleanup] Removed ${cleaned} stale tracking entries`);
+  }
+}, 5 * 60 * 1000);
 
 // Helper to log debug info
 function logDebug(operation, data) {
@@ -67,6 +168,7 @@ app.get("/", (req, res) => {
     version: VERSION,
     deploy_time: DEPLOY_TIME,
     events_stored: events.length,
+    stripe_events_queued: stripeEvents.length,
     pending_calls: pendingCalls.size,
     active_conferences: activeConferences.size,
     pending_ai_legs: pendingAILegs.size,
@@ -416,6 +518,14 @@ async function handleCallAnswered(payload) {
   const callControlId = payload?.call_control_id;
   const clientStateB64 = payload?.client_state;
 
+  // Save and remove pendingOutboundCall for this callControlId (prevents stale buildup)
+  // The saved data is used by the fallback path below if client_state is absent
+  const savedPendingOutbound = pendingOutboundCalls.get(callControlId) || null;
+  if (savedPendingOutbound) {
+    pendingOutboundCalls.delete(callControlId);
+    console.log(`[Webhook] Removed pendingOutboundCall for ${callControlId}`);
+  }
+
   // Check if this is an AI leg answering (has client_state)
   if (clientStateB64) {
     try {
@@ -623,10 +733,9 @@ async function handleCallAnswered(payload) {
   }
 
   // Fallback: Match outbound AI calls tracked from call.initiated
-  const pendingOutbound = pendingOutboundCalls.get(callControlId);
-  if (pendingOutbound) {
-    pendingOutboundCalls.delete(callControlId);
+  if (savedPendingOutbound) {
     {
+      const pendingOutbound = savedPendingOutbound;
       const agentPhoneNumber = pendingOutbound.from;
       const toNumber = pendingOutbound.to;
       const agentConfig = pendingOutbound.agentConfig;
